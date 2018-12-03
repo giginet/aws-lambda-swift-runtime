@@ -1,40 +1,70 @@
 import Foundation
 
 public struct Context {
-    let payload: Data?
-    let requestID: String
-    let functionARN: String
-    let deadline: Date
-    let xrayTraceID: String
-    let clientContext: [String: Any]?
-    let cognitoIdentifier: [String: Any]?
+    public let payload: Data?
+    public let requestID: String
+    public let functionARN: String
+    public let deadline: Date
+    public let xrayTraceID: String
+    public let clientContext: [String: Any]?
+    public let cognitoIdentifier: [String: Any]?
     var remainingTime: TimeInterval {
         return deadline.timeIntervalSinceNow
     }
 }
 
-public enum Error: Swift.Error {
+public enum RuntimeError: Error {
     case UnexpectedError(message: String)
     case APIError(statusCode: Int)
 }
 
-public enum Result {
-    case success(payload: Data, contentType: String)
-    case failure(errorMessage: String, errorType: String)
+public protocol LambdaError: Error {
+    var type: String { get }
+    var message: String { get }
+    var stackTrace: [String] { get }
+}
+
+public extension LambdaError {
+    var stackTrace: [String] {
+        return []
+    }
+}
+
+public extension LambdaError where Self: RawRepresentable, Self.RawValue == String {
+    var type: String {
+        return rawValue
+    }
+}
+
+private struct ErrorWrapper<E: LambdaError>: Encodable {
+    let errorType: String
+    let errorMessage: String
+    let stackTrace: [String]
     
-    private struct RawError: Encodable {
-        let errorMessage: String
-        let errorType: String
-        let stackTrace: [String] = []
+    init(_ error: E) {
+        errorType = error.type
+        errorMessage = error.message
+        stackTrace = error.stackTrace
     }
     
-    public var payload: Data {
+    enum CodingKeys: CodingKey {
+        case errorType
+        case errorMessage
+        case stackTrace
+    }
+}
+
+public enum Result<E: LambdaError> {
+    case success(payload: Data?, contentType: String)
+    case failure(error: E)
+    
+    public var payload: Data? {
         switch self {
         case .success(let payload, _):
             return payload
-        case .failure(let errorMessage, let errorType):
-            let error = RawError(errorMessage: errorMessage, errorType: errorType)
-            return try! JSONEncoder().encode(error)
+        case .failure(let error):
+            let wrapper = ErrorWrapper(error)
+            return try! JSONEncoder().encode(wrapper)
         }
     }
     
@@ -76,8 +106,8 @@ private struct Endpoint {
     }
 }
 
-public typealias Handler = (Context) -> Result
-public func run(_ handler: Handler) {
+public typealias Handler<E: LambdaError> = (Context) -> Result<E>
+public func run<E: LambdaError>(_ handler: Handler<E>) {
     guard let runtimeAPI = ProcessInfo.processInfo.environment["AWS_LAMBDA_RUNTIME_API"],
         let endpoint = Endpoint(runtimeAPI: runtimeAPI) else {
             fatalError("LAMBDA_SERVER_ADDRESS is not defined.")
@@ -99,7 +129,7 @@ public func run(_ handler: Handler) {
     fatalError("Exhausted all retries.")
 }
 
-private func postResult(_ result: Result, of context: Context, to endpoint: Endpoint) throws {
+private func postResult<E: LambdaError>(_ result: Result<E>, of context: Context, to endpoint: Endpoint) throws {
     var request: URLRequest
     switch result {
     case .success:
@@ -113,11 +143,11 @@ private func postResult(_ result: Result, of context: Context, to endpoint: Endp
         "content-type": result.contentType,
         "Expect": "",
         "transfer-encoding": "",
-        "content-length": String(result.payload.count),
+        "content-length": String(result.payload?.count ?? 0),
         ]
     request.httpBody = result.payload
     
-    var thrownError: Error? = nil
+    var thrownError: RuntimeError? = nil
     URLSession.shared.dataTask(with: request) { data, response, error in
         guard let response = response as? HTTPURLResponse else {
             fatalError()
@@ -125,7 +155,7 @@ private func postResult(_ result: Result, of context: Context, to endpoint: Endp
         
         let isSuccess = (200...300).contains(response.statusCode)
         if !isSuccess {
-            thrownError = Error.APIError(statusCode: response.statusCode)
+            thrownError = RuntimeError.APIError(statusCode: response.statusCode)
             return
         }
     }.resume()
@@ -136,17 +166,17 @@ private func postResult(_ result: Result, of context: Context, to endpoint: Endp
 private func fetchNextEvent(endpoint: Endpoint) throws -> Context {
     func createContext(data: Data?, response: HTTPURLResponse) throws -> Context {
         guard let requestID = response.allHeaderFields["Lambda-Runtime-Aws-Request-Id"] as? String else {
-            throw Error.UnexpectedError(message: "Missing Lambda-Runtime-Aws-Request-Id Header")
+            throw RuntimeError.UnexpectedError(message: "Missing Lambda-Runtime-Aws-Request-Id Header")
         }
         guard let functionARN = response.allHeaderFields["Lambda-Runtime-Invoked-Function-Arn"] as? String else {
-            throw Error.UnexpectedError(message: "Missing Lambda-Runtime-Invoked-Function-Arn Header")
+            throw RuntimeError.UnexpectedError(message: "Missing Lambda-Runtime-Invoked-Function-Arn Header")
         }
         guard let traceID = response.allHeaderFields["Lambda-Runtime-Trace-Id"] as? String else {
-            throw Error.UnexpectedError(message: "Missing Lambda-Runtime-Trace-Id Header")
+            throw RuntimeError.UnexpectedError(message: "Missing Lambda-Runtime-Trace-Id Header")
         }
         guard let deadlineString = response.allHeaderFields["Lambda-Runtime-Deadline-Ms"] as? String,
             let milisecond = Double(deadlineString) else {
-                throw Error.UnexpectedError(message: "Missing Lambda-Runtime-Deadline-Ms")
+                throw RuntimeError.UnexpectedError(message: "Missing Lambda-Runtime-Deadline-Ms")
         }
         let deadline = Date(timeIntervalSince1970: milisecond / 1000)
         
@@ -175,7 +205,7 @@ private func fetchNextEvent(endpoint: Endpoint) throws -> Context {
     }
     
     var context: Context!
-    var thrownError: Error? = nil
+    var thrownError: RuntimeError? = nil
     URLSession.shared.dataTask(with: endpoint.next) { data, response, error in
         do {
             guard let response = response as? HTTPURLResponse else {
@@ -183,7 +213,7 @@ private func fetchNextEvent(endpoint: Endpoint) throws -> Context {
             }
             context = try createContext(data: data, response: response)
         } catch {
-            thrownError = error as? Error
+            thrownError = error as? RuntimeError
         }
         
     }.resume()
