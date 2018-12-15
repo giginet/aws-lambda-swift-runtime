@@ -1,3 +1,5 @@
 # AWSLambdaRuntime
 
-A description of this package.
+AWS Lambda Runtime for Swift
+
+This product is under development.
